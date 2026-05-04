@@ -1,0 +1,154 @@
+# RUNNING SNAKEMAKE >=8 on a SLURM MANAGED HPC SYSTEM REQUIRES PLUGGINS + A PROFILE. HERE IS AN EXAMPLE
+# A slurm cluster profile example
+# Profile is applied with the `--profile slurm` flag when running snakemake
+# adapted from https://github.com/jdblischak/smk-simple-slurm/ 
+# & jhemmp https://github.com/aodenweller/pypsa-eur/blob/remind_develop_pypsa_v0.10.0/cluster_config/config.yaml
+# PIK-2024
+
+# ___________________ NOTE ___________________
+# Some rules in pypsa-earth may not be directly compatible with partition rules
+# e.g. if the internet-connected login nodes (here io) have a ram limit that is insufficient for a rule
+# (e.g. download_osm_data). Hack: run it twice, first on the io partition and then on a compute one
+
+# define the executor
+executor: cluster-generic
+jobs: 500
+
+# configure smk
+restart-times: 1
+max-jobs-per-second: 10
+max-status-checks-per-second: 1
+# local-threads: 1
+latency-wait: 60
+retries: 3
+keep-going: False
+rerun-incomplete: True
+printshellcmds: True
+# scheduler: greedy
+# use-conda: True
+rerun-trigger:
+- code
+- input
+- mtime
+- params
+verbose: false
+
+# define the cluster submission command (slurm wrapper)
+# email command --mail-user for master rule (email on end | fail)
+cluster-generic-submit-cmd:
+  mkdir -p logs_slurm/{rule} &&
+  sbatch
+    --partition={resources.partition}
+    --qos={resources.qos}
+    --cpus-per-task={resources.threads}
+    --mem={resources.mem_mb}
+    --job-name={rule}-{wildcards}-smk
+    --output=logs_slurm/{rule}/%j-{rule}-{wildcards}.out
+    --parsable
+    --export=PATH,LD_LIBRARY_PATH,GUROBI_HOME,HOME
+# cluster-generic-status-cmd: "python config/pik_hpc_profile/status-check.py"
+cluster-generic-cancel-cmd: scancel
+# --error=logs_slurm/{rule}/%j-{rule}-{wildcards}.out
+
+# now define the default resources
+default-resources:
+  partition: priority
+  qos: priority
+  mem_mb: 32000
+  time : 10
+  threads: 4
+
+set-resources:
+  base_network:
+    mem_mb: 20000
+    time: 30
+  simplify_network:
+    mem_mb: 32000
+    time: 30
+  cluster_network:
+    mem_mb: 20000
+    time: 30
+  build_bus_regions:
+    mem_mb: 32000
+    time: 30
+  build_powerplants:
+    mem_mb: 32000
+    time: 30
+  solve_network:
+    mem_mb: 90000
+    time : 80
+    threads: 6
+  build_cutout:
+    time: 9000
+    threads: 4
+    partition: io
+    qos: io
+    mem_mb: 20000
+  build_shapes:
+    time: 600
+    threads: 8
+    mem_mb: 16000
+  build_demand_profiles:
+    time: 600
+    threads: 8
+    mem_mb: 16000
+  build_renewable_potential:
+    time: 300
+    threads: 4
+    mem_mb: 20000
+  build_renewable_profiles:
+    time: 300
+    threads: 4
+    mem_mb: 30000
+  plot_network:
+    mem_mb: 8000
+    threads: 2
+  retrieve_databundle_light:
+    time: 600
+    threads: 1
+    partition: io # login
+    qos: io
+  retrieve_cost_data:
+    time: 300
+    threads: 1
+    partition: io # login
+    qos: io
+  download_global_buildings:
+    time: 300
+    threads: 1
+    partition: io
+    qos: io
+  retrieve_powerplants:
+    time: 300
+    threads: 2
+    partition: io
+    qos: io
+  retrieve_cutout:
+    time: 300
+    threads: 1
+    partition: io
+    qos: io
+    mem_mb: 4000
+  download_osm_data:
+    time: 300
+    threads: 1
+    # partition: io
+    # qos: io
+    # mem_mb: 8000
+
+
+# GROUPS
+# groups: 
+#   retrieve_databundle_light: retrieve
+#   retrieve_cutout: retrieve
+#   retrieve_cost_data: retrieve
+#   download_osm_data: retrieve
+#   retrieve_powerplants: retrieve
+#   download_global_buildings: retrieve
+# group-components:
+#   plot: 3
+#   build_load: 3
+#   prep_network: 3
+#   retrieve: 1 # io queue
+#   summary: 3
+#   prep_capacities: 3

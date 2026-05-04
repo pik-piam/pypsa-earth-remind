@@ -14,8 +14,10 @@ import subprocess
 import sys
 import time
 import zipfile
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
+from dataclasses import dataclass, field
 
 import country_converter as coco
 import geopandas as gpd
@@ -47,6 +49,8 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 # absolute path to config.default.yaml
 CONFIG_DEFAULT_PATH = os.path.join(BASE_DIR, "config.default.yaml")
 
+DEFAULT_TUNNEL_PORT = 1080
+LOGIN_NODE = "03"
 
 def check_config_version(config, fp_config=CONFIG_DEFAULT_PATH):
     """
@@ -445,91 +449,109 @@ def get_aggregation_strategies(aggregation_strategies):
 
     return bus_strategies, generator_strategies
 
-
 def mock_snakemake(
-    rulename, root_dir=None, submodule_dir=None, configfile=None, **wildcards
+    rulename: str,
+    configfiles: list | str = None,
+    snakefile_path: os.PathLike = None,
+    **wildcards,
 ):
-    """
-    This function is expected to be executed from the "scripts"-directory of "
-    the snakemake project. It returns a snakemake.script.Snakemake object,
-    based on the Snakefile.
+    """A function to enable scripts to run as standalone, giving them access to
+     the snakefile rule input, outputs etc
 
-    If a rule has wildcards, you have to specify them in **wildcards**.
+    WARNING: only to be used if snakemake is not in globals
 
-    Parameters
-    ----------
-    rulename: str
-        name of the rule for which the snakemake object should be generated
-    configfile: str
-        path to config file to be used in mock_snakemake
-    wildcards:
-        keyword arguments fixing the wildcards. Only necessary if wildcards are
-        needed.
+    Args:
+        rulename (str): the name of the rule
+        configfiles (list or str, optional): the config file or config file list. Defaults to None.
+        wildcards (optional):  keyword arguments fixing the wildcards (if any needed)
+    Raises:
+        FileNotFoundError: Config file not found
+    Example:
+        if "snakemake" not in globals():
+            snakemake = mock_snakemake(
+                rulename="my_rule",
+                configfiles="path/to/config.yaml",
+                wildcard1="value1")
+
+    Returns:
+        snakemake.script.Snakemake: an object storing all the rule inputs/outputs etc
     """
-    import os
 
     import snakemake as sm
-
-    try:
-        from pypsa.descriptors import Dict
-    except:
-        from pypsa.definitions.structures import Dict  # from pypsa version v0.31
+    from snakemake.api import Workflow
+    from snakemake.common import SNAKEFILE_CHOICES
     from snakemake.script import Snakemake
+    from snakemake.settings.types import (
+        ConfigSettings,
+        DAGSettings,
+        ResourceSettings,
+        StorageSettings,
+        WorkflowSettings,
+        OutputSettings,
+    )
+    from snakemake.logging import LoggerManager, logger
 
-    script_dir = Path(__file__).parent.resolve()
-    if root_dir is None:
-        root_dir = script_dir.parent
-    else:
-        root_dir = Path(root_dir).resolve()
+    # horrible hack
+    curr_path = os.getcwd()
 
-    user_in_script_dir = Path.cwd().resolve() == script_dir
-    if str(submodule_dir) in __file__:
-        # the submodule_dir path is only need to locate the project dir
-        os.chdir(Path(__file__[: __file__.find(str(submodule_dir))]))
-    elif user_in_script_dir:
-        os.chdir(root_dir)
-    elif Path.cwd().resolve() != root_dir:
-        raise RuntimeError(
-            "mock_snakemake has to be run from the repository root"
-            f" {root_dir} or scripts directory {script_dir}"
-        )
+    if snakefile_path:
+        os.chdir(os.path.dirname(snakefile_path))
     try:
-        for p in sm.SNAKEFILE_CHOICES:
+        snakefile = None
+        for p in SNAKEFILE_CHOICES:
             if os.path.exists(p):
                 snakefile = p
                 break
 
-        if isinstance(configfile, str):
-            with open(configfile, "r") as file:
-                configfile = yaml.safe_load(file)
+        if snakefile is None:
+            raise FileNotFoundError("Snakefile not found.")
 
-        workflow = sm.Workflow(
-            snakefile,
-            overwrite_configfiles=[],
-            rerun_triggers=[],
-            overwrite_config=configfile,
+        if configfiles is None:
+            configfiles = []
+        elif isinstance(configfiles, str):
+            configfiles = [configfiles]
+
+        
+        @dataclass
+        class FakeStorageProviderSettings:
+            shared_fs_usage: list = field(default_factory=list)
+
+        resource_settings = ResourceSettings()
+        config_settings = ConfigSettings(configfiles=map(Path, configfiles))
+        workflow_settings = WorkflowSettings()
+        storage_settings = StorageSettings()
+        dag_settings = DAGSettings(rerun_triggers=[])
+        workflow = Workflow(
+            config_settings=config_settings,
+            resource_settings=resource_settings,
+            workflow_settings=workflow_settings,
+            logger_manager=LoggerManager(logger, OutputSettings()),
+            storage_settings=storage_settings,
+            dag_settings=dag_settings,
+            storage_provider_settings={
+                "storageprovider": FakeStorageProviderSettings()
+                },
         )
         workflow.include(snakefile)
+
+        if configfiles:
+            for f in configfiles:
+                if not os.path.exists(f):
+                    raise FileNotFoundError(f"Config file {f} does not exist.")
+                workflow.configfile(f)
+
         workflow.global_resources = {}
-        try:
-            rule = workflow.get_rule(rulename)
-        except Exception as exception:
-            print(
-                exception,
-                f"The {rulename} might be a conditional rule in the Snakefile.\n"
-                f"Did you enable {rulename} in the config?",
-            )
-            raise
+        rule = workflow.get_rule(rulename)
         dag = sm.dag.DAG(workflow, rules=[rule])
-        wc = Dict(wildcards)
+        wc = wildcards
         job = sm.jobs.Job(rule, dag, wc)
 
-        def make_accessable(*ios):
+        def make_accessible(*ios):
             for io in ios:
-                for i in range(len(io)):
+                for i, _ in enumerate(io):
                     io[i] = os.path.abspath(io[i])
 
-        make_accessable(job.input, job.output, job.log)
+        make_accessible(job.input, job.output, job.log)
         snakemake = Snakemake(
             job.input,
             job.output,
@@ -542,15 +564,14 @@ def mock_snakemake(
             job.rule.name,
             None,
         )
-        snakemake.benchmark = job.benchmark
-
         # create log and output dir if not existent
         for path in list(snakemake.log) + list(snakemake.output):
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-
+    except Exception as e:
+        raise e
     finally:
-        if user_in_script_dir:
-            os.chdir(script_dir)
+        os.chdir(curr_path)
+
     return snakemake
 
 
@@ -1897,3 +1918,74 @@ def sanitize_locations(n):
             n.buses.country.ne("") & n.buses.country.notnull(),
             n.buses.location.map(n.buses.country),
         )
+
+
+# ============== HPC helpers ==================
+
+def setup_gurobi_tunnel_and_env(
+    tunnel_config: dict, logger: logging.Logger = None, attempts=4
+) -> subprocess.Popen:
+    """A utility function to set up the Gurobi environment variables and establish an
+    SSH tunnel on HPCs. Otherwise the license check will fail if the compute nodes do
+     not have internet access or a token server isn't set up
+
+    Args:
+        config (dict): the snakemake pypsa-china configuration
+        logger (logging.Logger, optional): Logger. Defaults to None.
+        attempts (int, optional): ssh connection attemps. Defaults to 4.
+    """
+    if not tunnel_config.get("use_tunnel", False):
+        return
+    logger.info("setting up tunnel")
+    user = os.getenv("USER")  # User is pulled from the environment
+    port = tunnel_config.get("tunnel_port", DEFAULT_TUNNEL_PORT)
+    login_node = tunnel_config.get("login_node", LOGIN_NODE)
+    timeout = tunnel_config.get("timeout_s", 60)
+
+    # bash commands for tunnel: reduce pipe err severity (too high from snakemake)
+    pipe_err = "set -o pipefail; "
+    ssh_command = f"ssh -vvv -fN -D {port} -o ConnectTimeout={timeout} {user}@login{login_node}"
+    logger.info(f"Attempting ssh tunnel to login node {login_node}")
+    # Run SSH in the background to establish the tunnel
+    socks_proc = subprocess.Popen(
+        pipe_err + ssh_command,
+        shell=True,
+        stderr=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    )
+
+    try:
+        stdout, stderr = socks_proc.communicate(timeout=timeout + 2)
+        err = stderr.decode()
+        logger.info(f"ssh err returns {str(err)}")
+        logger.info(f"ssh stdout returns {str(stdout)}")
+        if err.find("Permission") != -1 or err.find("Could not resolve hostname") != -1:
+            socks_proc.kill()
+        else:
+            logger.info("Gurobi Environment variables & tunnel set up successfully at attempt {i}.")
+    except subprocess.TimeoutExpired:
+        logger.error("SSH tunnel communication timed out.")
+
+    os.environ["https_proxy"] = f"socks5://127.0.0.1:{port}"
+    os.environ["SSL_CERT_FILE"] = tunnel_config.get(
+        "ssl_cert", "/p/projects/rd3mod/ssl/ca-bundle.pem_2022-02-08"
+    )
+    os.environ["GRB_CAFILE"] = tunnel_config.get(
+        "grb_cafile", "/p/projects/rd3mod/ssl/ca-bundle.pem_2022-02-08"
+    )
+
+    # Set up Gurobi environment variables
+    # TODO soft code
+    os.environ["GUROBI_HOME"] = tunnel_config.get(
+        "gurobi_home", "/p/projects/rd3mod/gurobi1103/linux64"
+    )
+    os.environ["PATH"] += f":{os.environ['GUROBI_HOME']}/bin"
+    if "LD_LIBRARY_PATH" in os.environ:
+        os.environ["LD_LIBRARY_PATH"] += f":{os.environ['GUROBI_HOME']}/lib"
+    os.environ["GRB_LICENSE_FILE"] = tunnel_config.get(
+        "license_path", "/p/projects/rd3mod/gurobi_rc/gurobi.lic"
+    )
+    os.environ["GRB_CURLVERBOSE"] = tunnel_config.get("verbose", "1")
+    os.environ["GRB_SERVER_TIMEOUT"] = tunnel_config.get("timeout", "10")
+
+    return socks_proc

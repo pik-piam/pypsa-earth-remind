@@ -11,7 +11,9 @@ sys.path.append("./scripts")
 
 from shutil import copyfile, move
 
-from snakemake.remote.HTTP import RemoteProvider as HTTPRemoteProvider
+# ====== set up snakemake providers =======
+storage:
+    provider="http",
 
 from _helpers import (
     create_country_list,
@@ -19,7 +21,7 @@ from _helpers import (
     check_config_version,
     copy_default_files,
     BASE_DIR,
-    branch,  # Remove if Snakemake >= 8.3.0
+    branch,
 )
 from build_demand_profiles import get_load_paths_gegis
 from retrieve_databundle_light import (
@@ -29,10 +31,10 @@ from retrieve_databundle_light import (
 from pathlib import Path
 
 
-HTTP = HTTPRemoteProvider()
-
 copy_default_files()
 
+# this fails when submitted to slurm - unclear why
+localrules: build_shapes
 
 configfile: "config.default.yaml"
 configfile: "configs/bundle_config.yaml"
@@ -85,13 +87,12 @@ wildcard_constraints:
 
 if config["custom_rules"] is not []:
     for rule in config["custom_rules"]:
-
         include: rule
 
 
 rule clean:
     run:
-        try:
+        try:    
             shell("snakemake -j 1 solve_all_networks --delete-all-output")
         except:
             shell("snakemake -j 1 solve_all_networks_monte --delete-all-output")
@@ -145,7 +146,7 @@ rule plot_all_summaries:
 if config["enable"].get("retrieve_databundle", True):
 
     bundles_to_download = get_best_bundles_in_snakemake(config)
-
+    logger.info(f"best bundles: {bundles_to_download}")
     rule retrieve_databundle_light:
         params:
             bundles_to_download=bundles_to_download,
@@ -445,8 +446,8 @@ if config["enable"].get("retrieve_cost_data", True):
         params:
             version=config["costs"]["technology_data_version"],
         input:
-            HTTP.remote(
-                f"raw.githubusercontent.com/PyPSA/technology-data/{config['costs']['technology_data_version']}/outputs/{cost_directory}"
+            storage.http(
+                f"https://raw.githubusercontent.com/PyPSA/technology-data/{config['costs']['technology_data_version']}/outputs/{cost_directory}"
                 + "costs_{year}.csv",
                 keep_local=True,
             ),
